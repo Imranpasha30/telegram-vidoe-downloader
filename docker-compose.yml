@@ -1,0 +1,114 @@
+version: '3.8'
+
+services:
+  telegram-mtproto:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+
+    image: telegram-mtproto:latest
+    container_name: telegram_mtproto_production
+
+    restart: unless-stopped
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      # Telegram MTProto Configuration
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
+      - TELEGRAM_PHONE=${TELEGRAM_PHONE}
+
+      # Database Configuration
+      - DATABASE_URL=${DATABASE_URL}
+
+      # AWS Configuration
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-ap-south-1}
+      - S3_BUCKET_NAME=${S3_BUCKET_NAME}
+
+      # Lambda Functions
+      - VIDEO_PROCESSOR_FUNCTION_NAME=${VIDEO_PROCESSOR_FUNCTION_NAME}
+      - RESPONSE_HANDLER_FUNCTION_NAME=${RESPONSE_HANDLER_FUNCTION_NAME}
+
+      # Optional Bot Token
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+
+      # Application Settings
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+      # Deployment Metadata
+      - GITHUB_SHA=${GITHUB_SHA}
+      - GITHUB_REF=${GITHUB_REF}
+      - DEPLOYED_AT=${DEPLOYED_AT}
+      - DEPLOYED_BY=${DEPLOYED_BY:-manual}
+
+    volumes:
+      # Persistent session storage (critical for MTProto)
+      - telegram_sessions:/app/sessions
+      # Log storage for debugging
+      - telegram_logs:/tmp/logs
+
+    networks:
+      - telegram_network
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+        labels: "service=telegram-mtproto,environment=production,version=1.0"
+
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "-s", "--max-time", "10", "http://localhost:8000/health" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    # Resource limits for production stability
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+    # Security settings
+    security_opt:
+      - no-new-privileges:true
+
+    # Read-only root filesystem for security (excluding writable directories)
+    read_only: false
+
+    tmpfs:
+      - /tmp:noexec,nosuid,size=100m
+
+# Named volumes for data persistence
+volumes:
+  telegram_sessions:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/ubuntu/telegram-mtproto/data/sessions
+
+  telegram_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: /home/ubuntu/telegram-mtproto/data/logs
+
+# Custom network for better isolation
+networks:
+  telegram_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

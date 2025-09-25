@@ -1,1 +1,40 @@
 C:\Users\user\AppData\Local\Programs\Python\Python313\python.exe -m venv venv
+
+
+
+# SSH to your EC2 instance
+ssh -i your-key.pem ubuntu@your-ec2-public-ip
+
+# Run the Docker installation script
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+
+# Add ubuntu user to docker group
+sudo usermod -aG docker ubuntu
+
+# Install Docker Compose
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# Install additional tools
+sudo apt update && sudo apt install -y git curl awscli
+
+# Logout and login again for docker group permissions
+exit
+
+
+
+# 1. Add ubuntu user to docker group (run this command)
+sudo usermod -aG docker ubuntu
+
+# 2. Install Docker Compose
+sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+sudo chmod +x /usr/local/bin/docker-compose
+
+# 3. Start Docker service (if not running)
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# 4. Verify Docker is working
+sudo docker --version
+sudo docker-compose --version
