@@ -36,3 +36,4 @@ Automated deployment via GitHub Actions to AWS EC2 with Docker.
 - **Production**: Deployed on AWS EC2 with IAM roles
 - **Monitoring**: Health checks and structured logging
 - **Security**: No credentials in code, IAM role-based access
+-
