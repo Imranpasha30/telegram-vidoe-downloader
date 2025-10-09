@@ -9,12 +9,14 @@ import psycopg2
 import boto3
 import logging
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
 
 # Initialize FastAPI app
 app = FastAPI(
@@ -25,8 +27,10 @@ app = FastAPI(
     redoc_url="/redoc" if os.getenv("ENVIRONMENT") != "production" else None
 )
 
+
 # Global telegram service instance
 telegram_service = None
+
 
 @app.get("/")
 async def root():
@@ -39,6 +43,7 @@ async def root():
         "environment": os.getenv("ENVIRONMENT", "development"),
         "description": "Advanced Telegram video processing with direct S3 upload and Lambda integration"
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -80,7 +85,9 @@ async def health_check():
             "TELEGRAM_PHONE",
             "DATABASE_URL",
             "S3_BUCKET_NAME",
-            "AWS_DEFAULT_REGION"
+            "AWS_DEFAULT_REGION",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY"
         ]
         
         missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -141,25 +148,44 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ Database connection failed: {e}")
     
-    # 4. AWS Services Check
+    # 4. AWS Services Check (with explicit credentials)
     try:
         aws_region = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
         s3_bucket = os.getenv("S3_BUCKET_NAME")
+        aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+        aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
         
-        if s3_bucket:
-            # Test S3 access
-            s3_client = boto3.client('s3', region_name=aws_region)
+        if not aws_access_key or not aws_secret_key:
+            health_status["checks"]["aws"] = {
+                "status": "unhealthy",
+                "error": "AWS credentials not configured (ACCESS_KEY_ID or SECRET_ACCESS_KEY missing)"
+            }
+            all_healthy = False
+            logger.error("❌ AWS credentials not configured")
+        elif s3_bucket:
+            # Test S3 access with explicit credentials
+            s3_client = boto3.client(
+                's3',
+                region_name=aws_region,
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key
+            )
             s3_client.head_bucket(Bucket=s3_bucket)
             
-            # Test Lambda access (just check client creation)
-            lambda_client = boto3.client('lambda', region_name=aws_region)
+            # Test Lambda access
+            lambda_client = boto3.client(
+                'lambda',
+                region_name=aws_region,
+                aws_access_key_id=aws_access_key,
+                aws_secret_access_key=aws_secret_key
+            )
             
             health_status["checks"]["aws"] = {
                 "status": "healthy",
                 "s3_bucket": s3_bucket,
                 "region": aws_region,
                 "services": ["s3", "lambda"],
-                "iam_role": "attached"
+                "auth_method": "access_keys"
             }
             logger.info(f"✅ AWS services check passed - S3: {s3_bucket}")
         else:
@@ -214,10 +240,15 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ Telegram check failed: {e}")
     
-    # 6. File System Check (sessions and logs directories)
+    # 6. File System Check (Railway-compatible directories)
     try:
-        sessions_dir = "/app/sessions"
+        # Railway uses /app as working directory
+        sessions_dir = os.path.join(os.getcwd(), "sessions")
         logs_dir = "/tmp/logs"
+        
+        # Create directories if they don't exist
+        os.makedirs(sessions_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
         
         sessions_exists = os.path.exists(sessions_dir)
         logs_exists = os.path.exists(logs_dir)
@@ -289,12 +320,12 @@ async def health_check():
     health_status["status"] = "healthy" if all_healthy else "unhealthy"
     
     # Add deployment metadata if available
-    if os.getenv("GITHUB_SHA"):
+    if os.getenv("RAILWAY_DEPLOYMENT_ID"):
         health_status["deployment"] = {
-            "github_sha": os.getenv("GITHUB_SHA"),
-            "github_ref": os.getenv("GITHUB_REF"),
-            "deployed_at": os.getenv("DEPLOYED_AT"),
-            "deployed_by": os.getenv("DEPLOYED_BY", "manual")
+            "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID"),
+            "service_id": os.getenv("RAILWAY_SERVICE_ID"),
+            "environment_id": os.getenv("RAILWAY_ENVIRONMENT_ID"),
+            "replica_id": os.getenv("RAILWAY_REPLICA_ID")
         }
     
     # Return appropriate HTTP status code
@@ -310,6 +341,7 @@ async def health_check():
         content=health_status
     )
 
+
 @app.get("/health/simple")
 async def simple_health_check():
     """Simple health check for basic monitoring"""
@@ -319,6 +351,7 @@ async def simple_health_check():
         "service": "telegram-mtproto-video-processor"
     }
 
+
 @app.get("/version")
 async def version_info():
     """Version and deployment information"""
@@ -326,13 +359,12 @@ async def version_info():
         "service": "Telegram MTProto Video Processor",
         "version": "1.0.0",
         "environment": os.getenv("ENVIRONMENT", "development"),
-        "github_sha": os.getenv("GITHUB_SHA", "unknown"),
-        "github_ref": os.getenv("GITHUB_REF", "unknown"),
-        "deployed_at": os.getenv("DEPLOYED_AT", "unknown"),
-        "deployed_by": os.getenv("DEPLOYED_BY", "unknown"),
+        "railway_deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "unknown"),
+        "railway_service_id": os.getenv("RAILWAY_SERVICE_ID", "unknown"),
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "fastapi_version": "0.104.1"
     }
+
 
 @app.get("/status")
 async def telegram_status():
@@ -360,6 +392,7 @@ async def telegram_status():
             "error": str(e)
         }
 
+
 @app.get("/metrics")
 async def metrics():
     """Basic application metrics"""
@@ -374,15 +407,27 @@ async def metrics():
     except Exception as e:
         return {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
 
+
 # Startup and Shutdown Events
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on application startup"""
     global telegram_service
     
-    logger.info("🚀 Starting Telegram MTProto Video Processor...")
+    logger.info("🚀 Starting Telegram MTProto Video Processor on Railway...")
     logger.info(f"📊 Environment: {os.getenv('ENVIRONMENT', 'development')}")
     logger.info(f"🐍 Python version: {sys.version}")
+    logger.info(f"🚂 Railway Deployment: {os.getenv('RAILWAY_DEPLOYMENT_ID', 'local')}")
+    
+    # Create necessary directories
+    try:
+        sessions_dir = os.path.join(os.getcwd(), "sessions")
+        logs_dir = "/tmp/logs"
+        os.makedirs(sessions_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        logger.info(f"✅ Created directories: {sessions_dir}, {logs_dir}")
+    except Exception as e:
+        logger.error(f"❌ Failed to create directories: {e}")
     
     try:
         # Initialize Telegram Service
@@ -399,6 +444,7 @@ async def startup_event():
         logger.error(f"❌ Failed to start application: {e}")
         raise
 
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Clean shutdown of services"""
@@ -414,6 +460,7 @@ async def shutdown_event():
     except Exception as e:
         logger.error(f"❌ Error during shutdown: {e}")
 
+
 # Error Handlers
 @app.exception_handler(404)
 async def not_found_handler(request, exc):
@@ -425,6 +472,7 @@ async def not_found_handler(request, exc):
             "timestamp": datetime.utcnow().isoformat()
         }
     )
+
 
 @app.exception_handler(500)
 async def internal_error_handler(request, exc):
@@ -438,15 +486,19 @@ async def internal_error_handler(request, exc):
         }
     )
 
+
 # Production ASGI application
 if __name__ == "__main__":
     import uvicorn
+    
+    # Get port from environment or default to 8000
+    port = int(os.getenv("PORT", 8000))
     
     # Production configuration
     uvicorn.run(
         app, 
         host="0.0.0.0", 
-        port=8000,
+        port=port,
         log_level="info",
         access_log=True
     )

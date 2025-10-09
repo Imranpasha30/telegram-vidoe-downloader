@@ -4,10 +4,13 @@ from telethon.sessions import StringSession
 import logging
 from dotenv import load_dotenv
 
+
 # Load environment variables from .env file
 load_dotenv()
 
+
 logger = logging.getLogger(__name__)
+
 
 class TelegramService:
     def __init__(self):
@@ -21,8 +24,16 @@ class TelegramService:
         print(f"Loading API Hash: {self.api_hash[:10]}...")
         print(f"Loading Phone: {self.phone}")
         
-        # Create client with session file
-        self.client = TelegramClient('session_name', self.api_id, self.api_hash)
+        # Use sessions directory in current working directory (Railway-compatible)
+        session_path = os.path.join(os.getcwd(), "sessions", "session_name")
+        
+        # Create sessions directory if it doesn't exist
+        os.makedirs(os.path.dirname(session_path), exist_ok=True)
+        
+        print(f"Session file path: {session_path}")
+        
+        # Create client with session file in sessions directory
+        self.client = TelegramClient(session_path, self.api_id, self.api_hash)
         self.connected = False
     
     async def start(self):
