@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from telegram.client import TelegramService
 import asyncio
 import os
@@ -18,18 +19,73 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Initialize FastAPI app
-app = FastAPI(
-    title="Telegram MTProto Video Processor",
-    description="Production-ready Telegram video processing service with AWS S3 and Lambda integration",
-    version="1.0.0",
-    docs_url="/docs" if os.getenv("ENVIRONMENT") != "production" else None,
-    redoc_url="/redoc" if os.getenv("ENVIRONMENT") != "production" else None
-)
-
-
 # Global telegram service instance
 telegram_service = None
+
+
+# 🆕 LIFESPAN CONTEXT MANAGER (replaces @app.on_event)@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan - startup and shutdown"""
+    global telegram_service
+    
+    # STARTUP
+    logger.info("🚀 Starting Telegram MTProto Video Processor on Railway...")
+    logger.info(f"📊 Environment: {os.getenv('ENVIRONMENT', 'development')}")
+    logger.info(f"🐍 Python version: {sys.version}")
+    logger.info(f"🚂 Railway Deployment: {os.getenv('ENVIRONMENT', 'local')}")
+    
+    # Create directories
+    try:
+        sessions_dir = os.path.join(os.getcwd(), "sessions")
+        logs_dir = "/tmp/logs"
+        os.makedirs(sessions_dir, exist_ok=True)
+        os.makedirs(logs_dir, exist_ok=True)
+        logger.info(f"✅ Created directories: {sessions_dir}, {logs_dir}")
+    except Exception as e:
+        logger.error(f"❌ Failed to create directories: {e}")
+    
+    try:
+        # Initialize Telegram Service (reads config from env vars)
+        telegram_service = TelegramService()
+        logger.info("📱 Telegram service initialized")
+        
+        # Start telegram client in background
+        asyncio.create_task(telegram_service.start())
+        logger.info("🔄 Telegram client startup task created")
+        
+        logger.info("✅ Application startup completed successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to start application: {e}")
+        raise
+    
+    # Application runs here
+    yield
+    
+    # SHUTDOWN
+    logger.info("🛑 Shutting down Telegram MTProto Video Processor...")
+    
+    try:
+        if telegram_service:
+            await telegram_service.stop()
+            logger.info("📱 Telegram service stopped")
+        
+        logger.info("✅ Application shutdown completed successfully")
+        
+    except Exception as e:
+        logger.error(f"❌ Error during shutdown: {e}")
+
+
+
+# 🆕 CREATE APP WITH LIFESPAN
+app = FastAPI(
+    title="Telegram MTProto Video Processor",
+    description="Railway-based video processing system with SQS queue",
+    version="2.0.0",
+    docs_url="/docs" if os.getenv("ENVIRONMENT") != "production" else None,
+    redoc_url="/redoc" if os.getenv("ENVIRONMENT") != "production" else None,
+    lifespan=lifespan  # 🆕 Use lifespan instead of @on_event
+)
 
 
 @app.get("/")
@@ -37,11 +93,11 @@ async def root():
     """Root endpoint with basic service information"""
     return {
         "service": "Telegram MTProto Video Processor",
-        "version": "1.0.0",
+        "version": "2.0.0",
         "status": "running",
         "timestamp": datetime.utcnow().isoformat(),
         "environment": os.getenv("ENVIRONMENT", "development"),
-        "description": "Advanced Telegram video processing with direct S3 upload and Lambda integration"
+        "description": "Advanced Telegram video processing with SQS queue and S3 storage"
     }
 
 
@@ -53,7 +109,7 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "environment": os.getenv("ENVIRONMENT", "development"),
-        "version": "1.0.0",
+        "version": "2.0.0",
         "service": "telegram-mtproto-video-processor",
         "checks": {}
     }
@@ -77,17 +133,19 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ System health check failed: {e}")
     
-    # 2. Environment Variables Check
+    # 2. Environment Variables Check (UPDATED for SQS)
     try:
         required_env_vars = [
             "TELEGRAM_API_ID",
             "TELEGRAM_API_HASH", 
             "TELEGRAM_PHONE",
             "DATABASE_URL",
-            "S3_BUCKET_NAME",
+            "S3_PROCESSING_BUCKET",  # 🆕 Updated
+            "SQS_QUEUE_URL",  # 🆕 New for queue system
             "AWS_DEFAULT_REGION",
             "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY"
+            "AWS_SECRET_ACCESS_KEY",
+            "API_VIDEO_KEY"  # 🆕 New
         ]
         
         missing_vars = [var for var in required_env_vars if not os.getenv(var)]
@@ -104,7 +162,8 @@ async def health_check():
             health_status["checks"]["environment"] = {
                 "status": "healthy",
                 "configured_variables": len(required_env_vars),
-                "aws_region": os.getenv("AWS_DEFAULT_REGION")
+                "aws_region": os.getenv("AWS_DEFAULT_REGION"),
+                "queue_system": "SQS"  # 🆕 Indicate queue system
             }
             logger.info("✅ Environment variables check passed")
     except Exception as e:
@@ -119,7 +178,6 @@ async def health_check():
     try:
         database_url = os.getenv("DATABASE_URL")
         if database_url:
-            # Quick connection test (don't keep connection open)
             conn = psycopg2.connect(database_url, connect_timeout=5)
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
@@ -148,22 +206,23 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ Database connection failed: {e}")
     
-    # 4. AWS Services Check (with explicit credentials)
+    # 4. AWS Services Check (UPDATED for SQS)
     try:
         aws_region = os.getenv("AWS_DEFAULT_REGION", "ap-south-1")
-        s3_bucket = os.getenv("S3_BUCKET_NAME")
+        s3_bucket = os.getenv("S3_PROCESSING_BUCKET")  # 🆕 Updated
+        sqs_queue_url = os.getenv("SQS_QUEUE_URL")  # 🆕 New
         aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
         aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
         
         if not aws_access_key or not aws_secret_key:
             health_status["checks"]["aws"] = {
                 "status": "unhealthy",
-                "error": "AWS credentials not configured (ACCESS_KEY_ID or SECRET_ACCESS_KEY missing)"
+                "error": "AWS credentials not configured"
             }
             all_healthy = False
             logger.error("❌ AWS credentials not configured")
-        elif s3_bucket:
-            # Test S3 access with explicit credentials
+        elif s3_bucket and sqs_queue_url:
+            # Test S3 access
             s3_client = boto3.client(
                 's3',
                 region_name=aws_region,
@@ -172,29 +231,33 @@ async def health_check():
             )
             s3_client.head_bucket(Bucket=s3_bucket)
             
-            # Test Lambda access
-            lambda_client = boto3.client(
-                'lambda',
+            # Test SQS access
+            sqs_client = boto3.client(
+                'sqs',
                 region_name=aws_region,
                 aws_access_key_id=aws_access_key,
                 aws_secret_access_key=aws_secret_key
             )
+            sqs_client.get_queue_attributes(QueueUrl=sqs_queue_url, AttributeNames=['QueueArn'])
             
             health_status["checks"]["aws"] = {
                 "status": "healthy",
                 "s3_bucket": s3_bucket,
+                "sqs_queue": sqs_queue_url[:50] + "...",  # 🆕 Show partial URL
                 "region": aws_region,
-                "services": ["s3", "lambda"],
+                "services": ["s3", "sqs"],  # 🆕 Updated services
                 "auth_method": "access_keys"
             }
-            logger.info(f"✅ AWS services check passed - S3: {s3_bucket}")
+            logger.info(f"✅ AWS services check passed - S3: {s3_bucket}, SQS configured")
         else:
             health_status["checks"]["aws"] = {
                 "status": "unhealthy",
-                "error": "S3_BUCKET_NAME not configured"
+                "error": "S3_PROCESSING_BUCKET or SQS_QUEUE_URL not configured",
+                "s3_configured": bool(s3_bucket),
+                "sqs_configured": bool(sqs_queue_url)
             }
             all_healthy = False
-            logger.error("❌ S3_BUCKET_NAME not configured")
+            logger.error("❌ AWS services not fully configured")
             
     except Exception as e:
         health_status["checks"]["aws"] = {
@@ -204,14 +267,13 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ AWS services check failed: {e}")
     
-    # 5. Telegram MTProto Configuration Check
+    # 5. Telegram MTProto Check
     try:
         api_id = os.getenv("TELEGRAM_API_ID")
         api_hash = os.getenv("TELEGRAM_API_HASH")
         phone = os.getenv("TELEGRAM_PHONE")
         
         if api_id and api_hash and phone:
-            # Check if telegram service is running
             telegram_connected = telegram_service and telegram_service.is_connected() if telegram_service else False
             
             health_status["checks"]["telegram"] = {
@@ -219,7 +281,7 @@ async def health_check():
                 "api_configured": True,
                 "phone_configured": bool(phone),
                 "service_connected": telegram_connected,
-                "api_id": api_id[:4] + "****"  # Partially mask for security
+                "api_id": api_id[:4] + "****"
             }
             logger.info("✅ Telegram configuration check passed")
         else:
@@ -240,13 +302,11 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ Telegram check failed: {e}")
     
-    # 6. File System Check (Railway-compatible directories)
+    # 6. File System Check
     try:
-        # Railway uses /app as working directory
         sessions_dir = os.path.join(os.getcwd(), "sessions")
         logs_dir = "/tmp/logs"
         
-        # Create directories if they don't exist
         os.makedirs(sessions_dir, exist_ok=True)
         os.makedirs(logs_dir, exist_ok=True)
         
@@ -255,27 +315,28 @@ async def health_check():
         sessions_writable = os.access(sessions_dir, os.W_OK) if sessions_exists else False
         logs_writable = os.access(logs_dir, os.W_OK) if logs_exists else False
         
+        # 🆕 Check for session file
+        session_file_exists = os.path.exists(os.path.join(sessions_dir, "session_name.session"))
+        
         if sessions_writable and logs_writable:
             health_status["checks"]["filesystem"] = {
                 "status": "healthy",
                 "sessions_dir": sessions_dir,
                 "logs_dir": logs_dir,
                 "sessions_writable": sessions_writable,
-                "logs_writable": logs_writable
+                "logs_writable": logs_writable,
+                "session_file_exists": session_file_exists  # 🆕 Important check
             }
             logger.info("✅ Filesystem check passed")
         else:
             health_status["checks"]["filesystem"] = {
                 "status": "unhealthy",
-                "sessions_dir": sessions_dir,
-                "logs_dir": logs_dir,
-                "sessions_exists": sessions_exists,
-                "logs_exists": logs_exists,
                 "sessions_writable": sessions_writable,
-                "logs_writable": logs_writable
+                "logs_writable": logs_writable,
+                "session_file_exists": session_file_exists
             }
             all_healthy = False
-            logger.error("❌ Filesystem check failed - directories not writable")
+            logger.error("❌ Filesystem check failed")
             
     except Exception as e:
         health_status["checks"]["filesystem"] = {
@@ -285,47 +346,41 @@ async def health_check():
         all_healthy = False
         logger.error(f"❌ Filesystem check failed: {e}")
     
-    # 7. Lambda Functions Check
+    # 7. api.video Configuration Check (🆕 NEW)
     try:
-        video_processor = os.getenv("VIDEO_PROCESSOR_FUNCTION_NAME")
-        response_handler = os.getenv("RESPONSE_HANDLER_FUNCTION_NAME")
+        api_video_key = os.getenv("API_VIDEO_KEY")
         
-        if video_processor and response_handler:
-            health_status["checks"]["lambda_functions"] = {
+        if api_video_key:
+            health_status["checks"]["api_video"] = {
                 "status": "healthy",
-                "video_processor": video_processor,
-                "response_handler": response_handler,
-                "configured": True
+                "configured": True,
+                "key_preview": api_video_key[:10] + "****"
             }
-            logger.info("✅ Lambda functions configuration check passed")
+            logger.info("✅ api.video configuration check passed")
         else:
-            health_status["checks"]["lambda_functions"] = {
+            health_status["checks"]["api_video"] = {
                 "status": "unhealthy",
-                "error": "Lambda function names not configured",
-                "video_processor_set": bool(video_processor),
-                "response_handler_set": bool(response_handler)
+                "error": "API_VIDEO_KEY not configured"
             }
             all_healthy = False
-            logger.error("❌ Lambda function names not configured")
+            logger.error("❌ api.video key not configured")
             
     except Exception as e:
-        health_status["checks"]["lambda_functions"] = {
+        health_status["checks"]["api_video"] = {
             "status": "unhealthy",
             "error": str(e)
         }
         all_healthy = False
-        logger.error(f"❌ Lambda functions check failed: {e}")
     
     # Set overall status
     health_status["status"] = "healthy" if all_healthy else "unhealthy"
     
-    # Add deployment metadata if available
+    # Add deployment metadata
     if os.getenv("RAILWAY_DEPLOYMENT_ID"):
         health_status["deployment"] = {
             "deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID"),
             "service_id": os.getenv("RAILWAY_SERVICE_ID"),
-            "environment_id": os.getenv("RAILWAY_ENVIRONMENT_ID"),
-            "replica_id": os.getenv("RAILWAY_REPLICA_ID")
+            "environment_id": os.getenv("RAILWAY_ENVIRONMENT_ID")
         }
     
     # Return appropriate HTTP status code
@@ -348,7 +403,8 @@ async def simple_health_check():
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "service": "telegram-mtproto-video-processor"
+        "service": "telegram-mtproto-video-processor",
+        "version": "2.0.0"
     }
 
 
@@ -357,10 +413,10 @@ async def version_info():
     """Version and deployment information"""
     return {
         "service": "Telegram MTProto Video Processor",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "queue_system": "SQS",  # 🆕 Indicate queue system
         "environment": os.getenv("ENVIRONMENT", "development"),
         "railway_deployment_id": os.getenv("RAILWAY_DEPLOYMENT_ID", "unknown"),
-        "railway_service_id": os.getenv("RAILWAY_SERVICE_ID", "unknown"),
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "fastapi_version": "0.104.1"
     }
@@ -376,8 +432,7 @@ async def telegram_status():
                 "status": "connected",
                 "user": f"{user_info.first_name} {user_info.last_name or ''}".strip(),
                 "phone": user_info.phone,
-                "username": getattr(user_info, 'username', None),
-                "connected_at": getattr(telegram_service, 'connected_at', None)
+                "username": getattr(user_info, 'username', None)
             }
         else:
             return {
@@ -399,66 +454,13 @@ async def metrics():
     try:
         return {
             "timestamp": datetime.utcnow().isoformat(),
-            "uptime_seconds": getattr(telegram_service, 'uptime_seconds', 0) if telegram_service else 0,
             "telegram_connected": telegram_service.is_connected() if telegram_service else False,
-            "processed_videos": getattr(telegram_service, 'processed_videos_count', 0) if telegram_service else 0,
-            "environment": os.getenv("ENVIRONMENT", "development")
+            "environment": os.getenv("ENVIRONMENT", "development"),
+            "queue_system": "SQS",
+            "version": "2.0.0"
         }
     except Exception as e:
         return {"error": str(e), "timestamp": datetime.utcnow().isoformat()}
-
-
-# Startup and Shutdown Events
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services on application startup"""
-    global telegram_service
-    
-    logger.info("🚀 Starting Telegram MTProto Video Processor on Railway...")
-    logger.info(f"📊 Environment: {os.getenv('ENVIRONMENT', 'development')}")
-    logger.info(f"🐍 Python version: {sys.version}")
-    logger.info(f"🚂 Railway Deployment: {os.getenv('RAILWAY_DEPLOYMENT_ID', 'local')}")
-    
-    # Create necessary directories
-    try:
-        sessions_dir = os.path.join(os.getcwd(), "sessions")
-        logs_dir = "/tmp/logs"
-        os.makedirs(sessions_dir, exist_ok=True)
-        os.makedirs(logs_dir, exist_ok=True)
-        logger.info(f"✅ Created directories: {sessions_dir}, {logs_dir}")
-    except Exception as e:
-        logger.error(f"❌ Failed to create directories: {e}")
-    
-    try:
-        # Initialize Telegram Service
-        telegram_service = TelegramService()
-        logger.info("📱 Telegram service initialized")
-        
-        # Start telegram client as background task
-        asyncio.create_task(telegram_service.start())
-        logger.info("🔄 Telegram client startup task created")
-        
-        logger.info("✅ Application startup completed successfully")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to start application: {e}")
-        raise
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean shutdown of services"""
-    logger.info("🛑 Shutting down Telegram MTProto Video Processor...")
-    
-    try:
-        if telegram_service:
-            await telegram_service.stop()
-            logger.info("📱 Telegram service stopped")
-        
-        logger.info("✅ Application shutdown completed successfully")
-        
-    except Exception as e:
-        logger.error(f"❌ Error during shutdown: {e}")
 
 
 # Error Handlers
@@ -491,10 +493,8 @@ async def internal_error_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     
-    # Get port from environment or default to 8000
     port = int(os.getenv("PORT", 8000))
     
-    # Production configuration
     uvicorn.run(
         app, 
         host="0.0.0.0", 

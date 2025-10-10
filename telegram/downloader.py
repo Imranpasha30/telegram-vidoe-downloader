@@ -237,9 +237,9 @@ class VideoDownloader:
             return {"status": "error", "message": error_msg}
     
     async def upload_to_s3(self, message, document, submission_id: str, volunteer_id: str, download_info: dict):
-        """Download from Telegram and upload to S3"""
+        """Stream video directly from Telegram to S3 without saving to disk"""
         
-        logger.info("📥 Starting MTProto to S3 upload")
+        logger.info("📥 Starting MTProto to S3 STREAMING upload (no disk I/O)")
         
         try:
             # Get file extension
@@ -254,63 +254,121 @@ class VideoDownloader:
             s3_key = f"queue_videos/{submission_id}.{file_extension}"
             logger.info(f"☁️ Target S3 key: {s3_key}")
             
-            # Create temp file
-            temp_dir = "/tmp"
-            os.makedirs(temp_dir, exist_ok=True)
+            # 🚀 STREAMING APPROACH - Use multipart upload
+            logger.info("🚀 Starting S3 multipart upload (streaming mode)")
             
-            with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{file_extension}', dir=temp_dir) as temp_file:
-                temp_file_path = temp_file.name
+            # Initialize multipart upload
+            multipart_upload = self.s3_client.create_multipart_upload(
+                Bucket=self.s3_bucket,
+                Key=s3_key,
+                ContentType='video/mp4',
+                Metadata={
+                    'submission_id': submission_id,
+                    'volunteer_id': volunteer_id,
+                    'uploaded_at': datetime.utcnow().isoformat(),
+                    'source': 'railway_sqs_queue',
+                    'sender_name': download_info.get('sender_name', '') or 'Unknown',
+                    'sender_phone': download_info.get('sender_phone', '') or 'Unknown',
+                    'file_extension': file_extension,
+                    'streaming_upload': 'true'
+                }
+            )
+            
+            upload_id = multipart_upload['UploadId']
+            logger.info(f"📤 Multipart upload started: {upload_id}")
+            
+            parts = []
+            part_number = 1
+            chunk_size = 5 * 1024 * 1024  # 5 MB chunks (S3 minimum for multipart)
+            buffer = bytearray()
+            total_uploaded = 0
+            file_size = document.size if document else 0
             
             try:
-                # Download from Telegram
-                logger.info("📥 Downloading from Telegram via MTProto...")
-                downloaded_file = await message.download_media(
-                    file=temp_file_path,
-                    progress_callback=self.progress_callback
+                # Download from Telegram in chunks and upload directly to S3
+                logger.info("⚡ Streaming from Telegram → S3 (no disk)")
+                
+                async for chunk in message.client.iter_download(message.media, chunk_size=chunk_size):
+                    buffer.extend(chunk)
+                    total_uploaded += len(chunk)
+                    
+                    # When buffer reaches chunk_size, upload to S3
+                    if len(buffer) >= chunk_size:
+                        # Upload this part to S3
+                        part_response = self.s3_client.upload_part(
+                            Bucket=self.s3_bucket,
+                            Key=s3_key,
+                            PartNumber=part_number,
+                            UploadId=upload_id,
+                            Body=bytes(buffer)
+                        )
+                        
+                        parts.append({
+                            'ETag': part_response['ETag'],
+                            'PartNumber': part_number
+                        })
+                        
+                        # Log progress
+                        if file_size > 0:
+                            percent = (total_uploaded / file_size) * 100
+                            logger.info(f"📊 Streaming progress: Part {part_number} uploaded | {percent:.1f}% ({total_uploaded/1024/1024:.1f}/{file_size/1024/1024:.1f} MB)")
+                        
+                        part_number += 1
+                        buffer.clear()  # Clear buffer for next chunk
+                
+                # Upload remaining data in buffer (last part)
+                if len(buffer) > 0:
+                    part_response = self.s3_client.upload_part(
+                        Bucket=self.s3_bucket,
+                        Key=s3_key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=bytes(buffer)
+                    )
+                    
+                    parts.append({
+                        'ETag': part_response['ETag'],
+                        'PartNumber': part_number
+                    })
+                    
+                    logger.info(f"📊 Final part {part_number} uploaded | 100.0%")
+                
+                # Complete multipart upload
+                self.s3_client.complete_multipart_upload(
+                    Bucket=self.s3_bucket,
+                    Key=s3_key,
+                    UploadId=upload_id,
+                    MultipartUpload={'Parts': parts}
                 )
                 
-                if not downloaded_file or not os.path.exists(downloaded_file):
-                    raise Exception("MTProto download failed")
+                logger.info(f"✅ S3 streaming upload complete: {s3_key}")
+                logger.info(f"📊 Total uploaded: {total_uploaded/1024/1024:.2f} MB in {part_number} parts")
                 
-                file_size = os.path.getsize(downloaded_file)
-                logger.info(f"✅ MTProto download complete: {file_size/1024/1024:.2f} MB")
-                
-                # Upload to S3
-                logger.info("☁️ Uploading to S3...")
-                with open(downloaded_file, 'rb') as f:
-                    self.s3_client.upload_fileobj(
-                        f,
-                        self.s3_bucket,
-                        s3_key,
-                        ExtraArgs={
-                            'ContentType': 'video/mp4',
-                            'Metadata': {
-                                'submission_id': submission_id,
-                                'volunteer_id': volunteer_id,
-                                'uploaded_at': datetime.utcnow().isoformat(),
-                                'source': 'railway_sqs_queue',
-                                'original_size': str(file_size),
-                                'sender_name': download_info.get('sender_name', '') or 'Unknown',
-                                'sender_phone': download_info.get('sender_phone', '') or 'Unknown',
-                                'file_extension': file_extension
-                            }
-                        }
-                    )
-                
+                # Verify upload
                 self.s3_client.head_object(Bucket=self.s3_bucket, Key=s3_key)
-                logger.info(f"✅ S3 upload verified: {s3_key}")
+                logger.info(f"✅ S3 upload verified")
                 
                 return s3_key
                 
-            finally:
-                if os.path.exists(temp_file_path):
-                    os.remove(temp_file_path)
-                    logger.info(f"🧹 Temp file cleaned up")
-            
+            except Exception as e:
+                # Abort multipart upload on error
+                logger.error(f"❌ Streaming upload failed, aborting: {e}")
+                try:
+                    self.s3_client.abort_multipart_upload(
+                        Bucket=self.s3_bucket,
+                        Key=s3_key,
+                        UploadId=upload_id
+                    )
+                    logger.info("🗑️ Multipart upload aborted")
+                except:
+                    pass
+                raise
+                
         except Exception as e:
-            logger.error(f"❌ S3 upload failed: {e}", exc_info=True)
+            logger.error(f"❌ S3 streaming upload failed: {e}", exc_info=True)
             raise
-    
+
+        
     async def send_to_sqs_queue(self, submission_id: str, volunteer_id: str, s3_key: str, download_info: dict):
         """Send processing job to SQS queue with description"""
         

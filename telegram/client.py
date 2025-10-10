@@ -20,9 +20,9 @@ class TelegramService:
         self.phone = os.getenv('TELEGRAM_PHONE')
         
         # Debug print (remove in production)
-        print(f"Loading API ID: {self.api_id}")
-        print(f"Loading API Hash: {self.api_hash[:10]}...")
-        print(f"Loading Phone: {self.phone}")
+        print(f"Loading API ID:Done")
+        print(f"Loading API Hash: Done...")
+        print(f"Loading Phone:Done")
         
         # Use sessions directory in current working directory (Railway-compatible)
         session_path = os.path.join(os.getcwd(), "sessions", "session_name")
